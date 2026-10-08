@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+GusApp/.build/
+GusApp/build/
+*.bak-*
+xcuserdata/
+*.profraw
