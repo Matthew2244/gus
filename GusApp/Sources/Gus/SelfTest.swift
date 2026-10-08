@@ -25,7 +25,7 @@ enum SelfTest {
         let contents = lib.contents(of: show)
         print("  \(show): sections \(contents.sections.map(\.title).joined(separator: ", "))")
         print("  \(show): \(contents.channels.count) channels")
-        check(!contents.sections.contains { ["FX", "PLAYBACK"].contains($0.name.uppercased()) }, "FX and PLAYBACK left out of sections")
+        check(!contents.sections.contains { ["FX", "PLAYBACK", "TRACKS"].contains($0.name.uppercased()) }, "FX, PLAYBACK and TRACKS left out of sections")
 
         let vocals = contents.sections.first { $0.name.uppercased() == "VOCALS" } ?? contents.sections.first
         let drums = contents.sections.first { $0.name.uppercased() == "DRUMS" } ?? contents.sections.first

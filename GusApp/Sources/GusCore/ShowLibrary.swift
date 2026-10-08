@@ -22,7 +22,7 @@ public struct ShowContents: Sendable, Equatable {
 public struct ShowLibrary: Sendable {
     public let folder: URL
     /// DCAs that are not sections of the band.
-    public static let excludedSections: Set<String> = ["FX", "PLAYBACK"]
+    public static let excludedSections: Set<String> = ["FX", "PLAYBACK", "TRACKS"]
 
     public init(folder: URL = ShowLibrary.defaultFolder) {
         self.folder = folder
