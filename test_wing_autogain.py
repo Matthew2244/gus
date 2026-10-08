@@ -246,7 +246,7 @@ class TestWording(unittest.TestCase):
     def test_guess_preset(self):
         self.assertEqual(W.guess_preset("Matt Vox"), "vocal")
         self.assertEqual(W.guess_preset("Kick In"), "drums")
-        self.assertEqual(W.guess_preset("Tom 3"), "drums")
+        self.assertEqual(W.guess_preset("Tom 3"), "toms")
         self.assertEqual(W.guess_preset("Montage"), "line")
         self.assertEqual(W.guess_preset("Horn 2"), "horns")
         self.assertEqual(W.guess_preset("Talkback"), "speech")
@@ -490,11 +490,12 @@ class TestCLI(unittest.TestCase):
         self.assertIn("gain 0,", out[0])
 
     def test_sim_signal_edge_cases(self):
-        rc, out = self.cli("-c", "Kick In,Tom 1,Snare 1 Top", "--sim-signal", "A1=-30,A7=silent,A3=clip")
+        # channel 3 by number: the show has called it "Snare 1 Top" and "Snare1 Top"
+        rc, out = self.cli("-c", "Kick In,Tom 1,3", "--sim-signal", "A1=-30,A7=silent,A3=clip")
         self.assertEqual(rc, 1)
         text = "\n".join(out)
         self.assertIn("Tom 1: WARNING, no signal heard", text)
-        self.assertIn("Snare 1 Top: WARNING, CLIPPING", text)
+        self.assertRegex(text, r"Snare ?1 Top: WARNING, CLIPPING")
 
     def test_json(self):
         buf = io.StringIO()
@@ -507,6 +508,309 @@ class TestCLI(unittest.TestCase):
         data = json.loads(buf.getvalue())
         self.assertEqual(data["inputs"][0]["source"], "B22")
         self.assertEqual(data["inputs"][0]["outcome"], "raised")
+
+
+# ---------------------------------------------------------------------------
+# Real audio in the simulator, and the fixes it led to. Every signal here is
+# made in the test, small and real-like: drum hits with decays, a voice that
+# sings in phrases with rests, keys that hold chords. No audio is committed.
+# ---------------------------------------------------------------------------
+import math as _math
+import random as _random
+import shutil as _shutil
+import wave as _wave
+
+
+def write_wav(path, channels, rate=8000, width=2):
+    """channels: list of equal-length float lists in -1..1."""
+    n = len(channels[0])
+    full = (1 << (8 * width - 1)) - 1
+    out = bytearray()
+    for i in range(n):
+        for ch in channels:
+            v = int(round(max(-1.0, min(1.0, ch[i])) * full))
+            out += v.to_bytes(width, "little", signed=True)
+    with _wave.open(path, "wb") as w:
+        w.setnchannels(len(channels))
+        w.setsampwidth(width)
+        w.setframerate(rate)
+        w.writeframes(bytes(out))
+
+
+def synth_kick(seconds=4.0, rate=8000, peak=0.03, every=0.5):
+    """Four on the floor: a 60 Hz thump with a fast decay, then nothing."""
+    out = [0.0] * int(seconds * rate)
+    for start in range(0, len(out), int(every * rate)):
+        for j in range(int(0.25 * rate)):
+            if start + j < len(out):
+                t = j / rate
+                out[start + j] = peak * _math.exp(-t * 18) * _math.sin(2 * _math.pi * 60 * t)
+    return out
+
+
+def synth_vocal(seconds=6.0, rate=8000, peak=0.01, seed=3):
+    """Sung phrases, 1.5 s each, each a few dB louder or softer than the
+    last, with half-second rests between them."""
+    rnd = _random.Random(seed)
+    out = [0.0] * int(seconds * rate)
+    t0 = 0.0
+    while t0 < seconds:
+        level = peak * 10 ** (-rnd.uniform(0, 6) / 20)
+        for j in range(int(1.5 * rate)):
+            i = int(t0 * rate) + j
+            if i >= len(out):
+                break
+            t = j / rate
+            env = _math.sin(_math.pi * min(1.0, t / 1.5)) ** 0.5
+            out[i] = level * env * _math.sin(2 * _math.pi * (220 + 4 * _math.sin(2 * _math.pi * 5 * t)) * t)
+        t0 += 2.0
+    return out
+
+
+def synth_keys(seconds=4.0, rate=8000, peak=0.2):
+    """A held chord: steady, low crest factor."""
+    return [peak / 3 * sum(_math.sin(2 * _math.pi * f * i / rate) for f in (261.6, 329.6, 392.0))
+            for i in range(int(seconds * rate))]
+
+
+def block_feed(blocks, offset=0.0):
+    return W.AudioFeed(None, offset, peaks=[list(blocks)])
+
+
+def phrase_windows(pattern, per=20, seed=1):
+    """One listen window (per frames) per entry in pattern, each a phrase
+    peaking at that level with real-ish movement under the peak."""
+    rnd = _random.Random(seed)
+    out = []
+    for pk in pattern:
+        w = [pk - rnd.uniform(3, 12) for _ in range(per)]
+        w[per // 3] = pk
+        out.extend(w)
+    return out
+
+
+class TestSimAudio(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        W._AUDIO_CACHE.clear()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        W._AUDIO_CACHE.clear()
+
+    def path(self, name):
+        return os.path.join(self.tmp.name, name)
+
+    def sine(self, amp, seconds=1.0, rate=8000):
+        return [amp * _math.sin(2 * _math.pi * 200 * i / rate) for i in range(int(seconds * rate))]
+
+    def test_reads_16_bit_mono_and_24_bit_stereo(self):
+        write_wav(self.path("m16.wav"), [self.sine(0.5)], width=2)
+        peaks = W.load_audio(self.path("m16.wav"))
+        self.assertEqual(len(peaks), 1)
+        self.assertEqual(len(peaks[0]), 20)                  # 1 s of 50 ms meter frames
+        for v in peaks[0]:
+            self.assertAlmostEqual(v, -6.02, delta=0.05)
+        write_wav(self.path("s24.wav"), [self.sine(0.5), self.sine(0.125)], width=3)
+        peaks = W.load_audio(self.path("s24.wav"))
+        self.assertEqual(len(peaks), 2)
+        self.assertAlmostEqual(peaks[0][5], -6.02, delta=0.05)
+        self.assertAlmostEqual(peaks[1][5], -18.06, delta=0.05)
+        self.assertAlmostEqual(W.AudioFeed(self.path("s24.wav")).block(5), -6.02, delta=0.05)
+        self.assertAlmostEqual(W.AudioFeed(self.path("s24.wav"), channel=1).block(5), -18.06, delta=0.05)
+
+    def test_gain_moves_the_level_and_the_meter_clips_at_zero(self):
+        write_wav(self.path("k.wav"), [self.sine(0.5)])
+        src = {("A", 1): {"name": "Kick In", "mode": "M", "g": 10.0, "vph": False}}
+        m = W.SimModel(src, {("A", 1): W.AudioFeed(self.path("k.wav"), -20)})
+        self.assertAlmostEqual(m.frame(("A", 1)), -16.02, delta=0.05)   # -6 - 20 + 10
+        src[("A", 1)]["g"] = 40.0
+        self.assertEqual(m.frame(("A", 1)), 0.0)
+
+    def test_audio_loops_when_it_runs_out(self):
+        f = block_feed([-10.0, -20.0, -30.0])
+        self.assertEqual([f.block(i) for i in range(5)], [-10.0, -20.0, -30.0, -10.0, -20.0])
+
+    def test_stereo_file_feeds_a_stereo_pair(self):
+        write_wav(self.path("oh.wav"), [self.sine(0.5), self.sine(0.125)])
+        src = {("A", 13): {"name": "Overheads", "mode": "ST", "g": 0.0},
+               ("A", 14): {"name": "Overheads", "mode": "ST", "g": 0.0}}
+        m = W.SimModel(src)
+        self.assertEqual(W.attach_audio(m, {("A", 13): (self.path("oh.wav"), 0.0)}), [])
+        self.assertEqual(m.levels[("A", 13)].channel, 0)
+        self.assertEqual(m.levels[("A", 14)].channel, 1)
+
+    def test_unreadable_files_keep_the_made_up_signal(self):
+        m = W.SimModel({("A", 1): {"name": "Kick", "mode": "M", "g": 0.0}})
+        notes = W.attach_audio(m, {("A", 1): (self.path("nope.wav"), 0.0)})
+        self.assertIn("no file", notes[0])
+        self.assertNotIn(("A", 1), m.levels)
+        with open(self.path("x.mp3"), "wb") as f:
+            f.write(b"not really audio")
+        old = W._ffmpeg
+        W._ffmpeg = lambda: None
+        try:
+            notes = W.attach_audio(m, {("A", 1): (self.path("x.mp3"), 0.0)})
+        finally:
+            W._ffmpeg = old
+        self.assertIn("ffmpeg isn't installed", notes[0])
+        self.assertIn("keeps the made-up signal", notes[0])
+
+    @unittest.skipUnless(_shutil.which("ffmpeg") or os.path.exists("/opt/homebrew/bin/ffmpeg"),
+                         "ffmpeg not installed")
+    def test_float_wav_goes_through_ffmpeg(self):
+        data = b"".join(struct.pack("<f", v) for v in self.sine(0.25))
+        hdr = (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt "
+               + struct.pack("<IHHIIHH", 16, 3, 1, 8000, 32000, 4, 32)
+               + b"data" + struct.pack("<I", len(data)))
+        with open(self.path("f.wav"), "wb") as f:
+            f.write(hdr + data)
+        peaks = W.load_audio(self.path("f.wav"))
+        self.assertAlmostEqual(max(peaks[0]), -12.04, delta=0.1)
+
+    def test_parse_sim_audio(self):
+        got = W.parse_sim_audio("A1=/x/kick.wav,B22=/x/vox, take 2.wav@-20")
+        self.assertEqual(got[("A", 1)], ("/x/kick.wav", 0.0))
+        self.assertEqual(got[("B", 22)], ("/x/vox, take 2.wav", -20.0))
+        with self.assertRaises(ValueError):
+            W.parse_sim_audio("kick.wav")
+
+    def test_audio_dir_matches_by_channel_name(self):
+        for n in ("Kick In", "Overheads L", "Overheads R", "B22", "Snare", "Nothing", "kick"):
+            write_wav(self.path(n + ".wav"), [self.sine(0.1, 0.1)])
+        os.remove(self.path("kick.wav"))
+        chans = [{"kind": "ch", "num": 1, "name": "Kick In", "grp": "A", "n": 1},
+                 {"kind": "ch", "num": 3, "name": "Snare Top", "grp": "A", "n": 3},
+                 {"kind": "ch", "num": 4, "name": "Snare Btm", "grp": "A", "n": 4},
+                 {"kind": "ch", "num": 13, "name": "Overheads", "grp": "A", "n": 13}]
+        sources = {("A", 13): {"name": "Overheads", "mode": "ST"},
+                   ("A", 14): {"name": "Overheads", "mode": "ST"}}
+        got, notes = W.match_audio_dir(self.tmp.name, chans, sources)
+        self.assertEqual({k: os.path.basename(v[0]) for k, v in got.items()},
+                         {("A", 1): "Kick In.wav", ("A", 13): "Overheads L.wav",
+                          ("A", 14): "Overheads R.wav", ("B", 22): "B22.wav"})
+        text = " ".join(notes)
+        self.assertIn("Snare.wav matches more than one input", text)
+        self.assertIn("Nothing.wav doesn't match", text)
+
+    @unittest.skipUnless(HAVE_SHOW, "The Woodshed.snap not present")
+    def test_cli_with_an_audio_folder(self):
+        folder = os.path.join(self.tmp.name, "band")
+        os.mkdir(folder)
+        write_wav(os.path.join(folder, "Kick In.wav"), [synth_kick(4.0, peak=0.03)])     # about -30
+        write_wav(os.path.join(folder, "Rhodes.wav"), [synth_keys(4.0, peak=0.02)])      # about -36
+        os.environ["WING_AUTOGAIN_SIM_STATE"] = os.path.join(self.tmp.name, "sim.json")
+        out = []
+        rc = W.main(["--simulate", "--sim-reset", "--sim-audio-dir", folder, "-c", "Kick In,Rhodes",
+                     "--log", os.path.join(self.tmp.name, "log"), "-q", "--plain", "--listen", "2"],
+                    out=out.append)
+        text = "\n".join(out)
+        self.assertEqual(rc, 0, text)
+        self.assertRegex(text, r"Kick In: peaks were minus 3\d\. Raised gain .* Now peaking around minus (9|10|11)\.")
+        self.assertRegex(text, r"Rhodes: peaks were minus 3\d\. Raised gain .* Now peaking around minus (9|10|11)\.")
+
+    def test_sim_audio_needs_simulate(self):
+        with self.assertRaises(SystemExit):
+            W.main(["--sim-audio", "A1=/x.wav", "-i", "A1", "--host", "127.0.0.1"], out=lambda s: None)
+
+
+class TestRealSignals(unittest.TestCase):
+    """Regressions from running Gus over a live multitrack. Each case is a
+    small made-up version of what the real recording showed."""
+
+    def sim(self, feeds, gains, names, follow=True):
+        src = {k: {"name": names[k], "mode": "M", "g": gains[k], "vph": False} for k in feeds}
+        return W.SimConsole(W.SimModel(src, dict(feeds), follow=follow), [], {})
+
+    def test_sparse_hits_at_low_gain_are_not_a_blip(self):
+        # A live snare at low gain: 14 frames above the silence line, in 14
+        # separate hits. The old rule needed 16 frames and called it a blip.
+        fr = [-80.0] * 160
+        for i in range(0, 160, 12):
+            fr[i] = -32.0
+        m = W.analyze(fr)
+        self.assertEqual(m.bursts, 14)
+        self.assertTrue(m.enough)
+        d = W.decide(m, 5.0, (-3.0, 45.5, 0.5), -10.0)
+        self.assertEqual(d.action, "raise")
+
+    def test_one_bump_is_still_a_blip(self):
+        fr = [-90.0] * 160
+        fr[40:48] = [-20.0] * 8               # one long bump: 8 frames, 1 burst
+        self.assertFalse(W.analyze(fr).enough)
+
+    def test_not_following_needs_real_evidence(self):
+        nf = W.not_following
+        self.assertTrue(nf([(0.5, 12.0)]))     # moved 12, level stayed put
+        self.assertTrue(nf([(1.0, 8.0)]))
+        self.assertFalse(nf([(3.0, 8.0)]))     # a softer phrase, not a dead box
+        self.assertFalse(nf([(0.0, 4.0)]))     # too small a move to judge
+        self.assertFalse(nf([(1.0, 12.0), (10.0, 18.0)]))   # a later pass showed it follows
+        self.assertTrue(nf([(-0.5, -10.0)]))   # lowered 10, level didn't drop
+
+    def test_a_softer_phrase_on_the_check_pass_does_not_hunt(self):
+        # Loud phrase, soft phrase, loud phrase: 5 dB apart, like the singer
+        # in the multitrack. Before: raise 8, raise 5 more on the soft
+        # phrase, lower 5 on the loud one, and a false "didn't follow"
+        # warning. Now the check pass remembers the loud phrase and holds.
+        blocks = phrase_windows([-20, -25, -20, -25, -20, -25])
+        c = self.sim({("B", 22): block_feed(blocks)}, {("B", 22): 0.0}, {("B", 22): "Matt Vox"})
+        res, lines, log = run(c, [W.Target("B", 22, "Matt Vox")])
+        r = res[0]
+        self.assertEqual([(x["old"], x["new"]) for x in log if x["kind"] == "change"], [(0.0, 8.0)])
+        self.assertFalse(r.not_following)
+        self.assertNotIn("didn't move with the gain", lines[-1])
+
+    def test_dead_stage_box_still_caught_and_gus_stops_raising(self):
+        blocks = phrase_windows([-20, -25, -20, -25, -20, -25])
+        c = self.sim({("B", 22): block_feed(blocks)}, {("B", 22): 0.0}, {("B", 22): "Matt Vox"},
+                     follow=False)
+        res, lines, log = run(c, [W.Target("B", 22, "Matt Vox")])
+        self.assertTrue(res[0].not_following)
+        self.assertIn("didn't move with the gain", lines[-1])
+        self.assertLessEqual(res[0].gain, 8.0)            # didn't keep climbing
+
+    def test_toms_have_their_own_preset_and_a_note_in_a_band_run(self):
+        self.assertEqual(W.guess_preset("Floor Tom"), "toms")
+        self.assertEqual(W.guess_preset("Tom 2"), "toms")
+        self.assertEqual(W.guess_preset("Custom 2"), "default")
+        self.assertEqual(W.PRESETS["toms"][0], -14.0)
+        c = make_sim({("A", 1): -30.0, ("A", 7): -30.0, ("A", 8): -30.0},
+                     sources={("A", 1): {"name": "Kick In", "mode": "M", "g": 0.0},
+                              ("A", 7): {"name": "Tom 1", "mode": "M", "g": 0.0},
+                              ("A", 8): {"name": "Tom 2", "mode": "M", "g": 0.0}})
+        ts = [W.Target("A", 1, "Kick In"), W.Target("A", 7, "Tom 1"), W.Target("A", 8, "Tom 2")]
+        res, lines, _ = run(c, ts)
+        text = "\n".join(lines)
+        self.assertEqual(text.count("toms are mostly bleed"), 1)
+        self.assertIn("Tom 1: ", [l for l in lines if "toms are mostly bleed" in l][0])
+        res, lines, _ = run(c, ts, each=True)
+        self.assertNotIn("toms are mostly bleed", "\n".join(lines))
+
+    def test_real_like_band_converges_from_low_right_and_hot(self):
+        # Kick (transient), a voice in phrases with rests, and held keys,
+        # written as WAVs and played through the meter emulation.
+        with tempfile.TemporaryDirectory() as d:
+            files = {("A", 1): ("kick.wav", synth_kick(6.0, peak=0.5), "Kick In"),
+                     ("B", 22): ("vox.wav", synth_vocal(8.0, peak=0.5), "Matt Vox"),
+                     ("B", 19): ("keys.wav", synth_keys(6.0, peak=0.5), "Rhodes")}
+            for k, (fn, sig, _) in files.items():
+                write_wav(os.path.join(d, fn), [sig])
+            # files peak around -6; at -36 they need about 26 to 30 dB of gain
+            for start, gain in (("low", 8.0), ("right", 28.0), ("hot", 40.0)):
+                src = {k: {"name": v[2], "mode": "M", "g": gain, "vph": False} for k, v in files.items()}
+                model = W.SimModel(src)
+                self.assertEqual(W.attach_audio(model, {k: (os.path.join(d, v[0]), -36.0)
+                                                        for k, v in files.items()}), [])
+                c = W.SimConsole(model, [], {})
+                ts = [W.Target(k[0], k[1], v[2]) for k, v in files.items()]
+                res, lines, _ = run(c, ts, listen=2.0)
+                for r in res:
+                    tgt = W.PRESETS[r.t.preset][0]
+                    self.assertFalse(r.not_following, (start, lines))
+                    self.assertIn(r.outcome, ("raised", "lowered", "held"), (start, lines))
+                    self.assertLessEqual(abs(r.last.peak - tgt), W.TOLERANCE_DB, (start, r.t.name, lines))
+                    self.assertFalse(r.last.clipped, (start, lines))
 
 
 # ---------------------------------------------------------------------------

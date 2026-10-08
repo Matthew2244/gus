@@ -21,13 +21,15 @@ Layers (the protocol layer is swappable; real-console testing only exercises
 WingConsole):
     WingConsole   real console: OSC (UDP 2223) for parameters, native binary
                   protocol (TCP 2222, channel 3) for meters, data on UDP
-    SimConsole    simulator: fake meter levels from a synthetic signal + gain
+    SimConsole    simulator: fake meter levels from a synthetic signal or a real
+                  recording (--sim-audio), plus gain
     decide()/analyze()/run_autogain()  console-independent logic
 
 Python 3.9+, standard library only.
 """
 
 import argparse
+import array
 import contextlib
 import datetime as _dt
 import fcntl
@@ -38,12 +40,15 @@ import queue
 import random
 import re
 import select
+import shutil
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import wave
 import zlib
 
 VERSION = "1.0 (2026-10-08, pre-console)"
@@ -112,6 +117,10 @@ SILENCE_DB = -50.0       # below this a frame counts as no signal
 CLIP_DB = -0.5           # at/above this, call it clipping
 MIN_ACTIVE_FRAMES = 6    # ~0.3 s of real signal at 20 frames/s
 MIN_ACTIVE_FRACTION = 0.10
+MIN_BURSTS = 4           # ... or this many separate bursts (sparse hits)
+POOL_PASSES = True       # judge check passes on every pass heard so far
+NF_MIN_CHANGE = 6.0      # "level didn't follow the gain": only judged past this much change
+NF_FRACTION = 1.0 / 3    # ... and only when the level moved less than this share of it
 HARD_TARGET_CEILING = -6.0   # no preset or --target may aim hotter than this
 HARD_MAX_STEP = 18.0
 
@@ -121,7 +130,8 @@ HARD_MAX_STEP = 18.0
 PRESETS = {
     "vocal":      (-12.0, "singing; singers get louder in the show"),
     "speech":     (-10.0, "talking; steadier than singing"),
-    "drums":      (-10.0, "kick, snare, toms, cymbals"),
+    "drums":      (-10.0, "kick, snare, hi-hat, cymbals"),
+    "toms":       (-14.0, "toms; mostly bleed until they're hit, so aim lower"),
     "perc":       (-12.0, "hand percussion"),
     "horns":      (-12.0, "brass and reeds; loud and dynamic"),
     "line":       (-10.0, "keys, DI, playback; steady line level"),
@@ -137,7 +147,8 @@ PRESET_WORDS = [
     ("vocal", r"vox|vocal|voice|sing|choir|bgv|harmony"),
     ("horns", r"horn|sax|tpt|trumpet|tbn|trombone|reed|clarinet|flute|brass|tuba|flugel"),
     ("perc", r"perc|conga|bongo|tumba|quinto|timbale|shaker|cajon|tamb|cowbell|djembe"),
-    ("drums", r"kick|snare|tom\b|tom \d|hi-?hat|\bhh\b|ride|overhead|\boh\b|drum|cymbal|crash"),
+    ("toms", r"\btoms?\b|\btom ?\d|floor ?tom|rack ?tom"),
+    ("drums", r"kick|snare|hi-?hat|\bhh\b|ride|overhead|\boh\b|drum|cymbal|crash"),
     ("instrument", r"bass|gtr|guitar|uke|banjo|mandolin|violin|vln|viola|cello|fiddle"),
     ("line", r"key|piano|organ|leslie|synth|montage|rhodes|stage|juno|yc61|hydra|legend|pad|playback|computer|track|di\b"),
 ]
@@ -342,6 +353,10 @@ class Measurement:
         else:
             self.avg = None
         self.clip_frames = sum(1 for f in self.frames if f >= CLIP_DB)
+        # separate bursts of signal: a snare groove is many short ones, a
+        # bump or a cough is one or two
+        self.bursts = sum(1 for i, f in enumerate(self.frames)
+                          if f > SILENCE_DB and (i == 0 or self.frames[i - 1] <= SILENCE_DB))
 
     @property
     def no_data(self):
@@ -354,7 +369,13 @@ class Measurement:
     @property
     def enough(self):
         need = max(MIN_ACTIVE_FRAMES, int(MIN_ACTIVE_FRACTION * self.count))
-        return self.active >= need
+        if self.active >= need:
+            return True
+        # Sparse but real: hits at a low gain sit above the silence line for a
+        # block or two each. Measured on a live snare at low gain: 14 active
+        # frames in 6 to 9 separate hits, which the frame count alone called
+        # "only a blip".
+        return self.active >= MIN_ACTIVE_FRAMES and self.bursts >= MIN_BURSTS
 
     @property
     def clipped(self):
@@ -387,6 +408,7 @@ class Decision:
         self.capped = capped
         self.limit = limit          # None, "max", "min", "user-max"
         self.expected_peak = expected_peak
+        self.max_step = None        # the per-pass cap this decision worked under
 
     @property
     def change(self):
@@ -451,7 +473,9 @@ def decide(meas, gain, rng, target_peak, max_step=12.0, tolerance=TOLERANCE_DB,
                         expected_peak=meas.peak)
     action = "raise" if new > gain else "lower"
     exp = None if meas.clipped else meas.peak + (new - gain)
-    return Decision(action, gain, new, wanted, capped, limit, exp)
+    d = Decision(action, gain, new, wanted, capped, limit, exp)
+    d.max_step = max_step
+    return d
 
 
 # ---------------------------------------------------------------------------
@@ -876,7 +900,7 @@ class WingConsole:
 # Simulator
 # ---------------------------------------------------------------------------
 SIM_LEVELS = {   # peak dBFS at 0 dB gain, by preset
-    "vocal": -40.0, "speech": -44.0, "drums": -24.0, "perc": -30.0,
+    "vocal": -40.0, "speech": -44.0, "drums": -24.0, "toms": -26.0, "perc": -30.0,
     "horns": -30.0, "line": -14.0, "instrument": -22.0, "room": -46.0,
     "default": -34.0,
 }
@@ -943,6 +967,9 @@ class SimModel:
         self.frame_no[key] = i + 1
         noise = -100.0 + g + self.rng.uniform(-2, 2)
         lv = self.level(key)
+        if isinstance(lv, AudioFeed):
+            # a real recording: its block peak, moved by the gain
+            return min(0.0, max(METER_FLOOR_DB, lv.block(i) + g, noise))
         if lv is None:
             v = noise
         elif (i // 6) % 4 == 3:            # a breath / gap between phrases
@@ -952,6 +979,279 @@ class SimModel:
         else:
             v = lv + g - abs(self.rng.gauss(0, 4))
         return min(0.0, max(-128.0, v))
+
+
+# ---------------------------------------------------------------------------
+# Real audio in the simulator (--sim-audio, --sim-audio-dir)
+#
+# Emulates the WING input meter from a recording: one reading per ~50 ms
+# block (METER_FRAME_S), the block's sample peak in dBFS, the same unit the
+# protocol layer decodes [ASSUMED, see METER_SCALE]. The file's own level is
+# "the level at 0 dB gain"; the preamp gain shifts it, and the meter clips at
+# 0 dBFS. Standard library only: WAV through the wave module, anything else
+# (AIFF, FLAC, MP3, float WAV) through ffmpeg when it is installed.
+# ---------------------------------------------------------------------------
+AUDIO_EXTS = (".wav", ".wave", ".aif", ".aiff", ".aifc", ".flac", ".mp3",
+              ".m4a", ".ogg", ".opus", ".caf")
+SIM_AUDIO_MAX_S = 600.0      # read at most this much of each file
+METER_FLOOR_DB = -128.0      # an int16 meter word in 1/256 dB bottoms out here
+
+
+class AudioError(Exception):
+    pass
+
+
+def _ffmpeg():
+    # A GUI-launched app gets a minimal PATH, so look in Homebrew's places too.
+    for cand in (shutil.which("ffmpeg"), "/opt/homebrew/bin/ffmpeg",
+                 "/usr/local/bin/ffmpeg"):
+        if cand and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _convert_to_wav(path, seconds):
+    ff = _ffmpeg()
+    if not ff:
+        raise AudioError("%s isn't a 16 or 24-bit WAV, and ffmpeg isn't installed "
+                         "to convert it" % os.path.basename(path))
+    fd, out = tempfile.mkstemp(prefix="gus-", suffix=".wav")
+    os.close(fd)
+    r = subprocess.run([ff, "-nostdin", "-v", "error", "-y", "-i", path,
+                        "-t", "%g" % seconds, "-c:a", "pcm_s24le", out],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0 or os.path.getsize(out) <= 44:
+        with contextlib.suppress(OSError):
+            os.unlink(out)
+        msg = (r.stderr or "").strip().splitlines()
+        raise AudioError("ffmpeg couldn't read %s%s" % (
+            os.path.basename(path), (": " + msg[-1]) if msg else ""))
+    return out
+
+
+def _pcm_to_ints(raw, width):
+    """Little-endian PCM bytes -> array of ints, full scale returned too."""
+    if width == 2:
+        a = array.array("h")
+        a.frombytes(raw[:len(raw) - len(raw) % 2])
+        full = 32768.0
+    elif width == 3:
+        n = len(raw) // 3
+        raw = raw[:3 * n]
+        buf = bytearray(4 * n)          # 24-bit -> top three bytes of int32
+        buf[1::4] = raw[0::3]
+        buf[2::4] = raw[1::3]
+        buf[3::4] = raw[2::3]
+        a = array.array("i")
+        a.frombytes(bytes(buf))
+        full = 2147483648.0
+    elif width == 4:
+        a = array.array("i")
+        a.frombytes(raw[:len(raw) - len(raw) % 4])
+        full = 2147483648.0
+    else:
+        raise AudioError("%d-bit audio" % (8 * width))
+    if sys.byteorder == "big":
+        a.byteswap()
+    return a, full
+
+
+def wav_block_peaks(path, block_s=METER_FRAME_S, max_seconds=SIM_AUDIO_MAX_S):
+    """Per-channel lists of block peaks in dBFS, one per meter frame."""
+    with wave.open(path, "rb") as w:
+        nch, width, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+        if width not in (2, 3, 4):
+            raise AudioError("%d-bit audio" % (8 * width))
+        per = max(1, int(round(rate * block_s)))
+        total = min(w.getnframes(), int(rate * max_seconds))
+        peaks = [[] for _ in range(nch)]
+        done = 0
+        while done + per <= total:
+            nblk = min(200, (total - done) // per)
+            raw = w.readframes(nblk * per)
+            a, full = _pcm_to_ints(raw, width)
+            got = len(a) // (per * nch)
+            for b in range(got):
+                lo = b * per * nch
+                hi = lo + per * nch
+                for c in range(nch):
+                    sl = a[lo + c:hi:nch]
+                    pk = max(max(sl), -min(sl))
+                    peaks[c].append(20 * math.log10(pk / full) if pk > 0
+                                    else METER_FLOOR_DB)
+            done += got * per
+            if got < nblk:
+                break
+    if not peaks[0]:
+        raise AudioError("%s is shorter than one meter frame" % os.path.basename(path))
+    return [[max(METER_FLOOR_DB, v) for v in ch] for ch in peaks]
+
+
+_AUDIO_CACHE = {}
+
+
+def load_audio(path):
+    """Block peaks for any audio file, cached by path. Raises AudioError."""
+    path = os.path.abspath(os.path.expanduser(path))
+    if path in _AUDIO_CACHE:
+        return _AUDIO_CACHE[path]
+    if not os.path.isfile(path):
+        raise AudioError("there's no file at %s" % path)
+    tmp = None
+    try:
+        try:
+            if os.path.splitext(path)[1].lower() not in (".wav", ".wave"):
+                raise wave.Error("not a WAV")
+            peaks = wav_block_peaks(path)
+        except (wave.Error, EOFError, AudioError):
+            # float WAV, 8-bit, AIFF, FLAC, MP3 ...: let ffmpeg make a 24-bit WAV
+            tmp = _convert_to_wav(path, SIM_AUDIO_MAX_S)
+            peaks = wav_block_peaks(tmp)
+    finally:
+        if tmp:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+    _AUDIO_CACHE[path] = peaks
+    return peaks
+
+
+class AudioFeed:
+    """One input's share of a recording: a channel of it (or the louder side
+    of all channels), shifted by `offset` dB. Loops when it runs out."""
+
+    def __init__(self, path, offset=0.0, channel=None, peaks=None):
+        self.path = path
+        self.offset = float(offset)
+        self.channel = channel
+        if peaks is None:
+            peaks = load_audio(path)
+        if channel is not None and channel < len(peaks):
+            self.blocks = peaks[channel]
+        else:
+            self.blocks = [max(v) for v in zip(*peaks)]
+        self.stereo_file = len(peaks) > 1
+
+    def block(self, i):
+        return self.blocks[i % len(self.blocks)] + self.offset
+
+    def __repr__(self):
+        return "AudioFeed(%s ch=%s %+g dB)" % (os.path.basename(self.path),
+                                              self.channel, self.offset)
+
+
+def parse_sim_audio(spec):
+    """'A1=/x/kick.wav,B22=~/vox.wav@-20' -> {(grp,n): (path, offset_dB)}.
+    @-20 makes the source 20 dB quieter than the file (any later part with no
+    '=' belongs to the previous path, so a comma in a file name still works)."""
+    pairs = []
+    for part in (spec or "").split(","):
+        if "=" in part and INPUT_RE.match(part.split("=", 1)[0]):
+            pairs.append(part.split("=", 1))
+        elif pairs:
+            pairs[-1][1] += "," + part
+        elif part.strip():
+            raise ValueError("expected INPUT=FILE in --sim-audio, got %r" % part)
+    out = {}
+    for k, v in pairs:
+        key = parse_input(k)
+        v = v.strip()
+        offset = 0.0
+        m = re.match(r"^(.*)@\s*([-+]?\d+(?:\.\d+)?)\s*$", v)
+        if m and not os.path.exists(os.path.expanduser(v)):
+            v, offset = m.group(1).strip(), float(m.group(2))
+        out[key] = (os.path.expanduser(v), offset)
+    return out
+
+
+def _norm_name(s):
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def match_audio_dir(folder, chans, sources):
+    """Pair audio files with inputs by name: 'Kick In.wav' -> the Kick In
+    channel's source, 'Kick.wav' -> it too if nothing else starts with Kick,
+    'A1.wav' -> A1, and 'Overheads L' / 'Overheads R' -> the two sides of a
+    stereo pair. Returns ({key: (path, offset, channel)}, [notes])."""
+    folder = os.path.expanduser(folder)
+    if not os.path.isdir(folder):
+        raise SystemExit("--sim-audio-dir: %s isn't a folder." % folder)
+    files = sorted(f for f in os.listdir(folder)
+                   if os.path.splitext(f)[1].lower() in AUDIO_EXTS
+                   and not f.startswith("."))
+
+    def lead(key):      # a stereo pair is one thing to match
+        if sources.get(key, {}).get("mode") in ("ST", "M/S") and key[1] % 2 == 0:
+            return (key[0], key[1] - 1)
+        return key
+
+    named = []          # (normalized name, key)
+    for c in chans:
+        if c["grp"] in GAIN_GROUPS and c["n"] and c["name"]:
+            named.append((_norm_name(c["name"]), lead((c["grp"], c["n"]))))
+    for key, s in sources.items():
+        if s.get("name"):
+            named.append((_norm_name(s["name"]), lead(key)))
+
+    out, notes = {}, []
+    for f in files:
+        stem = os.path.splitext(f)[0]
+        try:
+            out[parse_input(stem)] = (os.path.join(folder, f), 0.0, None)
+            continue
+        except ValueError:
+            pass
+        m = re.match(r"^(.*?)[\s_-]+([LR])$", stem, re.I)
+        tries = [(stem, None)] + ([(m.group(1), m.group(2).upper())] if m else [])
+        found = ambiguous = None
+        for exact in (True, False):
+            for base, side in tries:
+                nb = _norm_name(base)
+                hits = {k for n, k in named
+                        if nb and (n == nb if exact else n.startswith(nb))}
+                if len(hits) == 1:
+                    found = (hits.pop(), side)
+                    break
+                if len(hits) > 1 and ambiguous is None:
+                    ambiguous = True
+            if found:
+                break
+        if not found:
+            notes.append(("%s matches more than one input, so I skipped it; use "
+                          "--sim-audio to say which" if ambiguous else
+                          "%s doesn't match any channel name, so I skipped it") % f)
+            continue
+        key, side = found
+        if side and sources.get(key, {}).get("mode") in ("ST", "M/S"):
+            key = key if side == "L" else (key[0], key[1] + 1)
+        out[key] = (os.path.join(folder, f), 0.0, None)
+    return out, notes
+
+
+def attach_audio(model, mapping, out=None):
+    """Give SimModel inputs real audio. mapping: {key: (path, offset) or
+    (path, offset, channel)}. A stereo file on the odd input of a stereo pair
+    feeds both sides unless the even one was given its own file. Files that
+    can't be read are skipped with a sentence, and keep the made-up signal."""
+    notes = []
+    for key, val in sorted(mapping.items()):
+        path, offset = val[0], val[1]
+        channel = val[2] if len(val) > 2 else None
+        try:
+            src = model.sources.get(key, {})
+            pair = (src.get("mode") in ("ST", "M/S") and key[1] % 2 == 1
+                    and (key[0], key[1] + 1) not in mapping)
+            if pair and channel is None and len(load_audio(path)) > 1:
+                model.levels[key] = AudioFeed(path, offset, 0)
+                model.levels[(key[0], key[1] + 1)] = AudioFeed(path, offset, 1)
+            else:
+                model.levels[key] = AudioFeed(path, offset, channel)
+        except (AudioError, wave.Error, EOFError, OSError, subprocess.SubprocessError) as e:
+            notes.append("couldn't use %s for %s%d (%s), so it keeps the made-up signal"
+                         % (os.path.basename(path), key[0], key[1], e))
+    for n in notes:
+        if out:
+            out("Note: " + n + ".")
+    return notes
 
 
 class SimConsole:
@@ -1261,7 +1561,11 @@ class Result:
     def __init__(self, target):
         self.t = target
         self.first = None        # Measurement
-        self.last = None
+        self.last = None         # judged on everything heard (see POOL_PASSES)
+        self.last_raw = None     # just the latest pass
+        self.heard = []          # frames from every pass, minus the gain they had
+        self.ref = None          # (peak, gain) of the first clean pass
+        self.checks = []         # (level move, gain move) of later clean passes
         self.start_gain = None
         self.gain = None
         self.decisions = []
@@ -1314,6 +1618,18 @@ def measure_targets(console, targets, seconds):
     return out
 
 
+def not_following(checks):
+    """Did the level stop following the gain? checks: (level move, gain move)
+    of each clean pass since the first. Real music moves 3 to 6 dB between two
+    8-second windows on its own (a tom mic between fills, far more), so it
+    only counts once the gain has moved NF_MIN_CHANGE or more, and any one
+    pass where the level did move by a third of the gain clears it."""
+    big = [(lv, g) for lv, g in checks if abs(g) >= NF_MIN_CHANGE]
+    if not big:
+        return False
+    return not any(lv * (1 if g > 0 else -1) >= abs(g) * NF_FRACTION for lv, g in big)
+
+
 def apply_gain(console, res, new):
     t = res.t
     got = console.set_gain(t.grp, t.n, new)
@@ -1344,6 +1660,14 @@ def run_autogain(console, targets, opts, log, out, speaker=None, voice=None,
         r.rng, _src = console.gain_range(r.t.grp, r.t.n)
         r.start_gain = r.gain = console.gain(r.t.grp, r.t.n)
 
+    if not opts.get("each") and len(results) > 1:
+        toms = [r for r in results if r.t.preset == "toms"]
+        if toms:
+            # Measured on a live multitrack: in two thirds of 8-second
+            # windows mid-song a tom mic hears only the rest of the kit.
+            toms[0].warnings.append(
+                "toms are mostly bleed while the whole band plays; for a surer "
+                "reading, do them one at a time while the drummer plays them")
     groups = [[r] for r in results] if opts.get("each") else [results]
     for group in groups:
         if opts.get("each"):
@@ -1381,12 +1705,21 @@ def _run_group(console, group, opts, log, run_id, host, out, speaker, voice):
             m = meas[r.t.key]
             if r.first is None:
                 r.first = m
-            elif r.decisions and r.decisions[-1].change and m.enough and not m.clipped:
-                d = r.decisions[-1]
-                if d.expected_peak is not None and r.last is not None:
-                    level_move = m.peak - r.last.peak
-                    if abs(d.change) >= 3 and abs(level_move - d.change) > 4.0:
-                        r.not_following = True
+            if m.enough and not m.clipped:
+                if r.ref is None:
+                    r.ref = (m.peak, r.gain)
+                else:
+                    r.checks.append((m.peak - r.ref[0], r.gain - r.ref[1]))
+                    r.not_following = not_following(r.checks)
+            r.last_raw = m
+            if POOL_PASSES and not m.no_data:
+                # Everything heard so far, moved to today's gain: one quiet
+                # window can't undo what a loud one already showed. Kept even
+                # if the level seems not to follow the gain: then it reads
+                # louder than it is, and Gus stops raising, the safe side.
+                r.heard.extend(f - r.gain for f in m.frames)
+                if p > 0 and (m.enough or m.clipped):
+                    m = Measurement([f + r.gain for f in r.heard])
             r.last = m
             r.final_measured = True
             if p == max_passes:      # measure-only confirmation pass
@@ -1487,7 +1820,7 @@ def describe(r, opts, voice):
             parts.append("That should peak around %s." % say_num(d.expected_peak))
         if d.capped:
             parts.append("That's capped at %s for one pass; a real run would check and go again."
-                         % say_db(opts.get("max_step", 12.0)))
+                         % say_db(d.max_step or opts.get("max_step", 12.0)))
     else:
         moved = round(r.gain - r.start_gain, 3)
         if moved > 0:
@@ -1641,7 +1974,7 @@ def sim_state_path():
 
 
 def build_sim(show_path, signal_spec=None, link_stereo=True, persist=True,
-              reset=False, follow=True):
+              reset=False, follow=True, audio_spec=None, audio_dir=None, out=None):
     sources, chans, dcas = load_show(show_path)
     if persist and not reset:
         try:
@@ -1656,6 +1989,20 @@ def build_sim(show_path, signal_spec=None, link_stereo=True, persist=True,
             pass
     model = SimModel(sources, parse_sim_signal(signal_spec), link_stereo=link_stereo,
                      follow=follow)
+    mapping = {}
+    if audio_dir:
+        found, notes = match_audio_dir(audio_dir, chans, sources)
+        for n in notes:
+            if out:
+                out("Note: " + n + ".")
+        mapping.update(found)
+    if audio_spec:
+        try:
+            mapping.update(parse_sim_audio(audio_spec))
+        except ValueError as e:
+            raise SystemExit(str(e))
+    if mapping:
+        attach_audio(model, mapping, out)
     return SimConsole(model, chans, dcas), (sources, chans, dcas)
 
 
@@ -1701,6 +2048,12 @@ def build_parser():
                    help="use the built-in pretend WING instead of a real one")
     c.add_argument("--sim-signal", metavar="SPEC",
                    help='simulator only: input levels at 0 dB gain, like "A1=-30,B22=silent,A3=clip"')
+    c.add_argument("--sim-audio", metavar="SPEC",
+                   help='simulator only: drive inputs from recordings, like '
+                        '"A1=~/kick.wav,B22=~/vox.wav@-20" (@ shifts the level in dB)')
+    c.add_argument("--sim-audio-dir", metavar="FOLDER",
+                   help="simulator only: a folder of recordings named after the "
+                        "channels, like Kick In.wav or Overheads L.wav")
     c.add_argument("--sim-reset", action="store_true", help="simulator only: start from the show's gains")
     c.add_argument("--meter", choices=("source", "channel"), default="source",
                    help="which meters to read: the source itself (default) or its channel's input meter")
@@ -1798,9 +2151,13 @@ def main(argv=None, out=None):
 
     show = None
     show_path = None
+    if (args.sim_audio or args.sim_audio_dir) and not args.simulate:
+        raise SystemExit("--sim-audio and --sim-audio-dir are for the pretend WING; add --simulate.")
     if args.simulate:
         show_path = find_show(args.show or DEFAULT_SIM_SHOW)
-        console, show = build_sim(show_path, args.sim_signal, reset=args.sim_reset)
+        console, show = build_sim(show_path, args.sim_signal, reset=args.sim_reset,
+                                  audio_spec=args.sim_audio,
+                                  audio_dir=args.sim_audio_dir, out=out)
         host = "sim"
     else:
         host = args.host or os.environ.get("WING_HOST") or cfg.get("host")
